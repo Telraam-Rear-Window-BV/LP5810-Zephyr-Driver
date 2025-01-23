@@ -1,0 +1,15 @@
+# Copyright (c) 2025 Telraam Rearwindow BV
+# SPDX-License-Identifier: Apache-2.0
+
+config LP5810
+	bool "LP5810 LED driver"
+	default y
+	depends on DT_HAS_TI_LP5810_ENABLED
+	select I2C
+	help
+	  Enable LED driver for Texas Instruments LP5810.
+
+	  LP5810 LED driver has 4 channels (RGBW).
+	  The LP5810 is a 4-channel RGBW LED driver with autonomous animation engine control.
+	  The device has ultra-low normal operation current with 0.4mA (typical) when
+	  illuminate LEDs. Each channel can drive up to 51 mA per LED.

@@ -19,6 +19,6 @@ west update
 
 for building run following in `application` directory:
 ```
-west build
+west build -b nrf52840dk_nrf52840
 ```
 
