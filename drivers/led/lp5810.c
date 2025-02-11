@@ -197,20 +197,6 @@ static uint8_t get_programmable_time_option(uint16_t time_ms)
     return LP5810_MAXNR_PROGRAMMABLE_TIME_OPTIONS - 1;
 }
 
-static int broadcast_to_all_lp581x(const struct device *dev, uint16_t reg, uint8_t val)
-{
-	const struct lp5810_config *config = dev->config;
-	#define LP5810_BROADCAST_ADDR 0xDC
-	uint8_t reg_major = reg >> 8;
-	uint8_t reg_minor = reg & 0xFF;
-	if(reg_major>0x3) {
-		LOG_ERR("Invalid register address");
-		return -EINVAL;
-	}
-	uint16_t i2c_addr = LP5810_BROADCAST_ADDR + reg_major;
-	return i2c_reg_write_byte(config->i2c.bus, i2c_addr, reg_minor, val);
-}
-
 static int update_register(const struct device *dev, uint16_t reg, uint8_t val)
 {
 	const struct lp5810_config *config = dev->config;
@@ -359,8 +345,8 @@ static int update_aeu1_pwms(const struct device *dev, uint32_t led, uint16_t min
 {
 	uint16_t base_register = lp5810_led_base_register[led] + LP5810_LEDX_AEU1_BASE;
 	// convert min and max brightness to 0-255 range
-	uint8_t min_brightness = (min_brightness_perc * 255) / 100;
-	uint8_t max_brightness = (max_brightness_perc * 255) / 100;
+	uint8_t min_brightness = (uint8_t)((min_brightness_perc * 255) / 100);
+	uint8_t max_brightness = (uint8_t)((max_brightness_perc * 255) / 100);
 
     int ret = update_register(dev, base_register + LP5810_AEU_PWM_1, min_brightness);
     if (ret) {
@@ -391,16 +377,17 @@ static int update_aeu1_pwms(const struct device *dev, uint32_t led, uint16_t min
 }
 
 static int led_set_manual_brightness(const struct device *dev, uint32_t led,
-					 uint8_t value)
+					 uint8_t brightness_perc)
 {
+	uint8_t value = (uint8_t)(((uint16_t)brightness_perc * 255) / 100);
 	return update_register(dev, lp5810_manual_pwm_register[led], value);
 }
 static int led_set_automation_brightness(const struct device *dev, uint32_t led,
-					 uint8_t value)
+					 uint8_t brightness_perc)
 {
 	struct lp5810_data *data = dev->data;
 	struct led_data *dev_data = &data->dev_data;
-	int ret = update_aeu1_pwms(dev, led, dev_data->min_brightness, value);
+	int ret = update_aeu1_pwms(dev, led, dev_data->min_brightness, brightness_perc);
 	if (ret) {
 		LOG_ERR("failed to set pwms");
 		return ret;
@@ -410,16 +397,18 @@ static int led_set_automation_brightness(const struct device *dev, uint32_t led,
 }
 
 static int lp5810_led_set_brightness(const struct device *dev, uint32_t led,
-				     uint8_t value)
+				     uint8_t brightness_perc)
 {
 	struct lp5810_data *data = dev->data;
 	struct led_data *dev_data = &data->dev_data;
 
 	if (led > LP5810_MAX_LED_ID) {
+		LOG_ERR("invalid led id %d", led);
 		return -EINVAL;
 	}
-	if (value < dev_data->min_brightness ||
-		value > dev_data->max_brightness) {
+	if (brightness_perc < dev_data->min_brightness ||
+		brightness_perc > dev_data->max_brightness) {
+		LOG_ERR("invalid brightness value %d (min %d, max %d)", brightness_perc, dev_data->min_brightness, dev_data->max_brightness);
 		return -EINVAL;
 	}
 
@@ -431,9 +420,9 @@ static int lp5810_led_set_brightness(const struct device *dev, uint32_t led,
 
 	if (is_automation_enabled(dev, led))
 	{
-		return led_set_automation_brightness(dev, led, value);
+		return led_set_automation_brightness(dev, led, brightness_perc);
 	}
-	return led_set_manual_brightness(dev, led, value);
+	return led_set_manual_brightness(dev, led, brightness_perc);
 }
 
 static int lp5810_led_blink(const struct device *dev, uint32_t led,
@@ -525,15 +514,11 @@ static inline int lp5810_led_on(const struct device *dev, uint32_t led)
 {
 	struct lp5810_data *data = dev->data;
 	struct led_data *dev_data = &data->dev_data;
-
+	int ret;
 	if (led > LP5810_MAX_LED_ID) {
+		LOG_ERR("Invalid led id %d", led);
 		return -EINVAL;
 	}
-	int ret = set_led_status(dev, led, LP5810_LED_ENABLE);
-	if (ret) {
-        LOG_ERR("failed to enable LED");
-        return ret;
-    }
 	if (is_automation_enabled(dev, led))
 	{
 		ret = stop_automation(dev, led);
@@ -542,6 +527,12 @@ static inline int lp5810_led_on(const struct device *dev, uint32_t led)
 			return ret;
 		}
 	}
+
+	ret = set_led_status(dev, led, LP5810_LED_ENABLE);
+	if (ret) {
+        LOG_ERR("failed to enable LED");
+        return ret;
+    }
 
 	return led_set_manual_brightness(dev, led, dev_data->max_brightness);
 }
@@ -578,50 +569,11 @@ static int lp5810_led_init(const struct device *dev)
 	const struct lp5810_config *config = dev->config;
 	struct lp5810_data *data = dev->data;
 	struct led_data *dev_data = &data->dev_data;
-	static int broadcast = 0; // this broadcast should only be done 1nce for all LP581x devices
 	int ret;
+	uint8_t value;
 
-	//let's initialize the device
-	if (broadcast == 0) {
-		// see https://e2e.ti.com/support/power-management-group/power-management/f/power-management-forum/1384693/faq-lp5812-quick-program-steps-guide-for-lp5812-lp5810?tisearch=e2e-quicksearch&keymatch=LP5812%20program
-		// Manually Execute I2C Slave Addressing
-        // Broadcast Write Data 0x01 to Register 0x000 (Write 01h to register<0x000>)
-        // Broadcast Write Data 0x05 to Register 0x350 (Write 05h to register<0x350>)
-        // Broadcast Write Data 0x08 to Register 0x350 (Write 08h to register<0x350>)
-        // Broadcast Write Data 0x01 to Register 0x350 (Write 01h to register<0x350>)
-        // Broadcast Write Data 0x03 to Register 0x350 (Write 03h to register<0x350>)
-        // Broadcast Write Data 0x27 to Register 0x351 (Write 27h to register<0x351>)
-        // Broadcast Write Data 0x00 to Register 0x350 (Write 00h to register<0x350>)
-        // Broadcast Write Data 0x00 to Register 0x000 (Write 00h to register<0x000>)
-		// explanation from TI:
-		// For the Manually Execute I2C Slave Addressing, the reason is that we found
-		// some corner case which the IC will not recognize its own address correctly
-		// when power up. So to fix this problem, we offer this software workaround.
-		// We usually suggest customers add this code in the first of all codes and
-		// then try to config device.
-		ret = broadcast_to_all_lp581x(dev, 0x000, 0x01);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x350, 0x05);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x350, 0x08);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x350, 0x01);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x350, 0x03);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x351, 0x27);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x350, 0x00);
-		if (ret != 0) goto failed_broadcast;
-		ret = broadcast_to_all_lp581x(dev, 0x000, 0x00);
-		if (ret != 0) {
-		failed_broadcast:
-			LOG_ERR("Failed to broadcast to all LP581x devices");
-			return ret;
-		}
-		broadcast = 1;
-	}
-	//after the broadcast the device should be able to find its address
+	LOG_INF("driver started");
+
 	if (!device_is_ready(config->i2c.bus)) {
 		LOG_ERR("I2C device not ready");
 		return -ENODEV;
@@ -648,85 +600,128 @@ static int lp5810_led_init(const struct device *dev)
 	dev_data->min_brightness = 0;
 	dev_data->max_brightness = 100;
 
-	//set chip enable
-	ret = update_register(dev, LP5810_ENABLE, LP5810_ENABLE_CHIP_EN);
+	// first interaction with chip seems to be failing, so let's read ENABLE register first
+	// we will try in a for loop with 10msec sleep
+	for (int i = 0; i < 10; i++) {
+		ret = read_register(dev, LP5810_ENABLE, &value);
+		if (ret == 0) {
+			// if enabled, reset the chip
+			if ((value & LP5810_ENABLE_CHIP_EN) != 0) {
+				LOG_INF("Reset LP5810 chip");
+				ret = update_register(dev, LP5810_RESET, 0x01);
+				if (ret != 0) {
+					LOG_ERR("Failed to reset LP5810 chip %d", ret);
+					return ret;
+				}
+				// wait for reset to complete
+				k_sleep(K_MSEC(10));
+			}
+			break;
+		}
+		k_sleep(K_MSEC(10));
+	}
+
+	//let's first disable the chip (might be on, from previous reset)
+	ret = update_register(dev, LP5810_ENABLE, 0);
 	if (ret != 0) {
-        LOG_ERR("Failed to enable LP5810 chip");
+        LOG_ERR("Failed to disable LP5810 chip %d", ret);
         return ret;
     }
+	//disable all leds
+	ret = update_register(dev, LP5810_LED_EN, 0x00);
+	if (ret != 0) {
+		LOG_ERR("Failed to disable all LP5810 LEDs %d", ret);
+		return ret;
+	}
 
 	//set LED drive mode as direct drive mode
 	ret = update_register(dev, LP5810_CONFIG_1, 0x00);
 	if (ret != 0) {
-        LOG_ERR("Failed to set LP5810 drive mode");
+        LOG_ERR("Failed to set LP5810 drive mode %d", ret);
         return ret;
     }
-
-	//Set 12.75mA peak current for all LEDs in manual mode
-	ret = update_register(dev, LP5810_MANUAL_DC_0, 0xFF);
+	// disable all fault detection (LOD and LSD)
+	ret = update_register(dev, LP5810_CONFIG_12, 0);
 	if (ret != 0) {
-        LOG_ERR("Failed to set LP5810 peak current DC0");
-        return ret;
-    }
-	ret = update_register(dev, LP5810_MANUAL_DC_1, 0xFF);
-	if (ret != 0) {
-        LOG_ERR("Failed to set LP5810 peak current DC1");
-        return ret;
-    }
-	ret = update_register(dev, LP5810_MANUAL_DC_2, 0xFF);
-	if (ret != 0) {
-        LOG_ERR("Failed to set LP5810 peak current DC2");
-        return ret;
-    }
-	ret = update_register(dev, LP5810_MANUAL_DC_3, 0xFF);
-	if (ret != 0) {
-		LOG_ERR("Failed to set LP5810 peak current DC3");
+		LOG_ERR("Failed to set LP5810 lsd threshold %d", ret);
 		return ret;
 	}
 
-
-	//Set 12.75mA peak current for all LEDs in automation mode
-	ret = update_register(dev, LP5810_AUTO_DC_0, 0xFF);
+	// disable all automation
+	ret = update_register(dev, LP5810_CONFIG_2, 0);
 	if (ret != 0) {
-		LOG_ERR("Failed to set LP5810 peak current DC0");
-		return ret;
-	}
-	ret = update_register(dev, LP5810_AUTO_DC_1, 0xFF);
-	if (ret != 0) {
-		LOG_ERR("Failed to set LP5810 peak current DC1");
-		return ret;
-	}
-	ret = update_register(dev, LP5810_AUTO_DC_2, 0xFF);
-	if (ret != 0) {
-		LOG_ERR("Failed to set LP5810 peak current DC2");
-		return ret;
-	}
-	ret = update_register(dev, LP5810_AUTO_DC_3, 0xFF);
-	if (ret != 0) {
-		LOG_ERR("Failed to set LP5810 peak current DC3");
+		LOG_ERR("Failed to disable all LP5810 Auto Animation %d", ret);
 		return ret;
 	}
 
-	//disable all leds
-	ret = update_register(dev, LP5810_LED_EN, 0x00);
-	if (ret != 0) {
-        LOG_ERR("Failed to disable all LP5810 LEDs");
-        return ret;
-    }
-
-	//disable all Auto Animation
-	ret = update_register(dev, LP5810_CONFIG_3, 0x00);
-	if (ret != 0) {
-        LOG_ERR("Failed to disable all LP5810 Auto Animation");
-        return ret;
-    }
-
-	//send update cmd to update the registers
+	// update config
 	ret = update_register(dev, LP5810_CMD_UPDATE, LP5810_CMD_UPDATE_VALUE);
 	if (ret != 0) {
-        LOG_ERR("Failed to send update command to LP5810");
+		LOG_ERR("Failed to send update command to LP5810 %d", ret);
+		return ret;
+	}
+	k_sleep(K_SECONDS(1));
+	ret = read_register(dev, LP5810_TSD_CONFIG_STATUS, &value);
+	if (ret != 0) {
+		LOG_ERR("Failed to read LP5810 tsd config status %d", ret);
+		return ret;
+	}
+	if ((value & 0x01) != 0) {
+		LOG_ERR("LP5810 TSD config status is not 0");
+		return -EIO;
+	}
+
+	//Set max DC current for all LEDs in manual mode, this will be board specific
+	//evaluated these by looking at LOD status registers (will get 1 if set too high)
+	ret = update_register(dev, LP5810_MANUAL_DC_0, 0xD);
+	if (ret != 0) {
+        LOG_ERR("Failed to set LP5810 peak current DC0 %d", ret);
         return ret;
     }
+	ret = update_register(dev, LP5810_MANUAL_DC_1, 0xB);
+	if (ret != 0) {
+        LOG_ERR("Failed to set LP5810 peak current DC1 %d", ret);
+        return ret;
+    }
+	ret = update_register(dev, LP5810_MANUAL_DC_2, 0x9);
+	if (ret != 0) {
+        LOG_ERR("Failed to set LP5810 peak current DC2 %d", ret);
+        return ret;
+    }
+	ret = update_register(dev, LP5810_MANUAL_DC_3, 0x0);
+	if (ret != 0) {
+		LOG_ERR("Failed to set LP5810 peak current DC3 %d", ret);
+		return ret;
+	}
+
+	//Set max DC current for all LEDs in automation mode
+	ret = update_register(dev, LP5810_AUTO_DC_0, 0x0D);
+	if (ret != 0) {
+		LOG_ERR("Failed to set LP5810 peak current DC0 %d", ret);
+		return ret;
+	}
+	ret = update_register(dev, LP5810_AUTO_DC_1, 0x0B);
+	if (ret != 0) {
+		LOG_ERR("Failed to set LP5810 peak current DC1 %d", ret);
+		return ret;
+	}
+	ret = update_register(dev, LP5810_AUTO_DC_2, 0x09);
+	if (ret != 0) {
+		LOG_ERR("Failed to set LP5810 peak current DC2 %d", ret);
+		return ret;
+	}
+	ret = update_register(dev, LP5810_AUTO_DC_3, 0x00);
+	if (ret != 0) {
+		LOG_ERR("Failed to set LP5810 peak current DC3 %d", ret);
+		return ret;
+	}
+
+	//enable the chip
+	ret = update_register(dev, LP5810_ENABLE, LP5810_ENABLE_CHIP_EN);
+	if (ret != 0) {
+		LOG_ERR("Failed to enable LP5810 chip %d", ret);
+		return ret;
+	}
 	return 0;
 }
 
