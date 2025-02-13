@@ -654,23 +654,6 @@ static int lp5810_led_init(const struct device *dev)
 		return ret;
 	}
 
-	// update config
-	ret = update_register(dev, LP5810_CMD_UPDATE, LP5810_CMD_UPDATE_VALUE);
-	if (ret != 0) {
-		LOG_ERR("Failed to send update command to LP5810 %d", ret);
-		return ret;
-	}
-	k_sleep(K_SECONDS(1));
-	ret = read_register(dev, LP5810_TSD_CONFIG_STATUS, &value);
-	if (ret != 0) {
-		LOG_ERR("Failed to read LP5810 tsd config status %d", ret);
-		return ret;
-	}
-	if ((value & 0x01) != 0) {
-		LOG_ERR("LP5810 TSD config status is not 0");
-		return -EIO;
-	}
-
 	//Set max DC current for all LEDs in manual mode, this will be board specific
 	//evaluated these by looking at LOD status registers (will get 1 if set too high)
 	ret = update_register(dev, LP5810_MANUAL_DC_0, 0xD);
@@ -721,6 +704,23 @@ static int lp5810_led_init(const struct device *dev)
 	if (ret != 0) {
 		LOG_ERR("Failed to enable LP5810 chip %d", ret);
 		return ret;
+	}
+
+	// update config
+	ret = update_register(dev, LP5810_CMD_UPDATE, LP5810_CMD_UPDATE_VALUE);
+	if (ret != 0) {
+		LOG_ERR("Failed to send update command to LP5810 %d", ret);
+		return ret;
+	}
+	k_sleep(K_MSEC(10));
+	ret = read_register(dev, LP5810_TSD_CONFIG_STATUS, &value);
+	if (ret != 0) {
+		LOG_ERR("Failed to read LP5810 tsd config status %d", ret);
+		return ret;
+	}
+	if ((value & 0x01) != 0) {
+		LOG_ERR("LP5810 TSD config status is not 0");
+		return -EIO;
 	}
 	return 0;
 }
